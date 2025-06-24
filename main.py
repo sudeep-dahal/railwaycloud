@@ -3,6 +3,8 @@ import aiohttp
 import csv
 import os
 import glob
+import smtplib
+from email.message import EmailMessage
 from aiohttp import ClientTimeout
 from dotenv import load_dotenv
 
@@ -13,11 +15,15 @@ url = 'http://srv.dofe.gov.np/Services/DofeWebService.svc/GetFinalApprovalInfo'
 start_point = int(os.getenv('START_POINT'))
 end_point = int(os.getenv('END_POINT'))
 
-chunk_size = 10000  # Save after every 10,000 records
+chunk_size = 10000
 error_stickers = []
 data_chunk = {}
-csv_save_tasks = []
 headers = set()
+
+# Email credentials
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
+EMAIL_TO = os.getenv("EMAIL_TO")
 
 async def fetch(session, sticker_no, max_retries=3):
     for attempt in range(max_retries):
@@ -49,53 +55,46 @@ def write_csv(filename, data_chunk, headers):
         for row in data_chunk.values():
             writer.writerow(row)
 
+def send_email_with_attachment(subject, body, to_email, attachment_path, smtp_user, smtp_pass):
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = smtp_user
+    msg["To"] = to_email
+    msg.set_content(body)
+
+    with open(attachment_path, "rb") as f:
+        file_data = f.read()
+        file_name = os.path.basename(attachment_path)
+        msg.add_attachment(file_data, maintype="application", subtype="octet-stream", filename=file_name)
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(smtp_user, smtp_pass)
+        smtp.send_message(msg)
+
+    print(f"📧 Email sent with {file_name} to {to_email}")
+
 async def save_to_csv_async(file_index, data_chunk, headers):
     filename = f"final_permission{file_index if file_index > 0 else ''}.csv"
     print(f"[WRITE] Saving {len(data_chunk)} records to {filename}")
     await asyncio.to_thread(write_csv, filename, data_chunk, headers)
     print(f"[DONE] Saved: {filename}")
 
-async def main():
-    file_index = 0
-    counter = 0
-
-    async with aiohttp.ClientSession() as session:
-        for sticker_no in range(start_point, end_point):
-            sticker_num = f"{sticker_no:09d}"
-            print(f"Queueing {sticker_num}")
-            
-            res = await fetch(session, sticker_num)
-            if res and 'StickerNo' in res:
-                data_chunk[res['StickerNo']] = res
-                headers.update(res.keys())
-                counter += 1
-
-            # Save after every 10,000
-            if counter > 0 and counter % chunk_size == 0:
-                await save_to_csv_async(file_index, data_chunk.copy(), list(headers))
-                data_chunk.clear()
-                file_index += 1
-
-            await asyncio.sleep(1)  # Sleep 3 seconds after every request
-
-    # Save remaining data
-    if data_chunk:
-        await save_to_csv_async(file_index, data_chunk, list(headers))
-
-    # Merge all chunk files
-    merge_csv_files('final_permission*.csv', 'final_permission_merged.csv')
-
-    if error_stickers:
-        print(f"\n❌ Failed stickers: {error_stickers}")
-    else:
-        print("\n✅ All stickers processed successfully.")
+    await asyncio.to_thread(
+        send_email_with_attachment,
+        subject=f"CSV Chunk {file_index} Scraped",
+        body=f"Attached is the CSV file with {len(data_chunk)} records.",
+        to_email=EMAIL_TO,
+        attachment_path=filename,
+        smtp_user=EMAIL_USER,
+        smtp_pass=EMAIL_PASS
+    )
 
 def merge_csv_files(pattern, output_file):
     print(f"\n[MERGE] Merging all chunk files into {output_file}...")
     all_files = sorted(f for f in glob.glob(pattern) if not f.endswith('_merged.csv'))
     if not all_files:
         print("⚠️ No CSV files found to merge.")
-        return
+        return 0
 
     seen = set()
     with open(output_file, 'w', newline='', encoding='utf-8') as fout:
@@ -112,6 +111,54 @@ def merge_csv_files(pattern, output_file):
                         seen.add(key)
                         writer.writerow(row)
     print(f"[DONE] Merged into {output_file} ({len(seen)} records)")
+    return len(seen)
+
+async def main():
+    file_index = 0
+    counter = 0
+
+    async with aiohttp.ClientSession() as session:
+        for sticker_no in range(start_point, end_point):
+            sticker_num = f"{sticker_no:09d}"
+            print(f"Queueing {sticker_num}")
+            
+            res = await fetch(session, sticker_num)
+            if res and 'StickerNo' in res:
+                data_chunk[res['StickerNo']] = res
+                headers.update(res.keys())
+                counter += 1
+
+            if counter > 0 and counter % chunk_size == 0:
+                await save_to_csv_async(file_index, data_chunk.copy(), list(headers))
+                data_chunk.clear()
+                file_index += 1
+
+            await asyncio.sleep(4)  # 1 request + 3 sec sleep
+
+    # Save any remaining data
+    if data_chunk:
+        await save_to_csv_async(file_index, data_chunk, list(headers))
+
+    # Merge CSV files
+    merged_filename = 'final_permission_merged.csv'
+    total_records = merge_csv_files('final_permission*.csv', merged_filename)
+
+    # Email final merged file
+    if total_records > 0:
+        await asyncio.to_thread(
+            send_email_with_attachment,
+            subject="✅ All Stickers Processed - Final Merged CSV",
+            body=f"Merged CSV file with {total_records} total records is attached.",
+            to_email=EMAIL_TO,
+            attachment_path=merged_filename,
+            smtp_user=EMAIL_USER,
+            smtp_pass=EMAIL_PASS
+        )
+
+    if error_stickers:
+        print(f"\n❌ Failed stickers: {error_stickers}")
+    else:
+        print("\n✅ All stickers processed successfully.")
 
 if __name__ == "__main__":
     asyncio.run(main())
