@@ -133,7 +133,7 @@ async def main():
                 data_chunk.clear()
                 file_index += 1
 
-            await asyncio.sleep(4)  # 1 request + 3 sec sleep
+            await asyncio.sleep(1)  # 1 request + 3 sec sleep
 
     # Save any remaining data
     if data_chunk:
