@@ -12,7 +12,7 @@ url = 'http://srv.dofe.gov.np/Services/DofeWebService.svc/GetFinalApprovalInfo'
 
 start_point = int(os.getenv('START_POINT'))
 end_point = int(os.getenv('END_POINT'))
-chunk_size = 5
+chunk_size = 10000
 error_stickers = []
 data_chunk = {}
 headers = set()
