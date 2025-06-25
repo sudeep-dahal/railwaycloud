@@ -114,7 +114,7 @@ async def main():
                 data_chunk.clear()
                 file_index += 1
 
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)
 
     if data_chunk:
         await save_and_upload_chunk(file_index, data_chunk, list(headers))
