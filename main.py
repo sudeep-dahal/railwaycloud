@@ -2,9 +2,7 @@ import asyncio
 import aiohttp
 import csv
 import os
-import glob
-import smtplib
-from email.message import EmailMessage
+import dropbox
 from aiohttp import ClientTimeout
 from dotenv import load_dotenv
 
@@ -14,16 +12,30 @@ url = 'http://srv.dofe.gov.np/Services/DofeWebService.svc/GetFinalApprovalInfo'
 
 start_point = int(os.getenv('START_POINT'))
 end_point = int(os.getenv('END_POINT'))
-
-chunk_size = 10000
+chunk_size = 5
 error_stickers = []
 data_chunk = {}
 headers = set()
 
-# Email credentials
-EMAIL_USER = os.getenv("EMAIL_USER")
-EMAIL_PASS = os.getenv("EMAIL_PASS")
-EMAIL_TO = os.getenv("EMAIL_TO")
+DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
+
+if not DROPBOX_ACCESS_TOKEN:
+    raise Exception("Missing DROPBOX_ACCESS_TOKEN in environment variables")
+
+dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
+
+def write_csv(filename, data_chunk, headers):
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        for row in data_chunk.values():
+            writer.writerow(row)
+
+def upload_to_dropbox(local_path, dropbox_path):
+    with open(local_path, "rb") as f:
+        print(f"[UPLOAD] Uploading {local_path} to Dropbox at {dropbox_path}...")
+        dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode.overwrite)
+    print(f"[DONE] Uploaded to Dropbox: {dropbox_path}")
 
 async def fetch(session, sticker_no, max_retries=3):
     for attempt in range(max_retries):
@@ -44,52 +56,21 @@ async def fetch(session, sticker_no, max_retries=3):
                 continue
             else:
                 error_stickers.append(sticker_no)
-                print(f"[ERROR] {sticker_no} failed after {max_retries} attempts")
+                print(f"[ERROR] {sticker_no} failed after {max_retries} attempts: {e}")
                 return None
     return None
 
-def write_csv(filename, data_chunk, headers):
-    with open(filename, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
-        writer.writeheader()
-        for row in data_chunk.values():
-            writer.writerow(row)
-
-def send_email_with_attachment(subject, body, to_email, attachment_path, smtp_user, smtp_pass):
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = smtp_user
-    msg["To"] = to_email
-    msg.set_content(body)
-
-    with open(attachment_path, "rb") as f:
-        file_data = f.read()
-        file_name = os.path.basename(attachment_path)
-        msg.add_attachment(file_data, maintype="application", subtype="octet-stream", filename=file_name)
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(smtp_user, smtp_pass)
-        smtp.send_message(msg)
-
-    print(f"📧 Email sent with {file_name} to {to_email}")
-
-async def save_to_csv_async(file_index, data_chunk, headers):
-    filename = f"final_permission{file_index if file_index > 0 else ''}.csv"
+async def save_and_upload_chunk(file_index, data_chunk, headers):
+    filename = f"finalpermission{file_index if file_index > 0 else ''}.csv"
     print(f"[WRITE] Saving {len(data_chunk)} records to {filename}")
     await asyncio.to_thread(write_csv, filename, data_chunk, headers)
     print(f"[DONE] Saved: {filename}")
 
-    await asyncio.to_thread(
-        send_email_with_attachment,
-        subject=f"CSV Chunk {file_index} Scraped",
-        body=f"Attached is the CSV file with {len(data_chunk)} records.",
-        to_email=EMAIL_TO,
-        attachment_path=filename,
-        smtp_user=EMAIL_USER,
-        smtp_pass=EMAIL_PASS
-    )
+    dropbox_path = f"/{filename}"
+    await asyncio.to_thread(upload_to_dropbox, filename, dropbox_path)
 
 def merge_csv_files(pattern, output_file):
+    import glob
     print(f"\n[MERGE] Merging all chunk files into {output_file}...")
     all_files = sorted(f for f in glob.glob(pattern) if not f.endswith('_merged.csv'))
     if not all_files:
@@ -120,8 +101,8 @@ async def main():
     async with aiohttp.ClientSession() as session:
         for sticker_no in range(start_point, end_point):
             sticker_num = f"{sticker_no:09d}"
-            print(f"Queueing {sticker_num}")
-            
+            print(f"[QUEUE] Processing {sticker_num}")
+
             res = await fetch(session, sticker_num)
             if res and 'StickerNo' in res:
                 data_chunk[res['StickerNo']] = res
@@ -129,31 +110,21 @@ async def main():
                 counter += 1
 
             if counter > 0 and counter % chunk_size == 0:
-                await save_to_csv_async(file_index, data_chunk.copy(), list(headers))
+                await save_and_upload_chunk(file_index, data_chunk.copy(), list(headers))
                 data_chunk.clear()
                 file_index += 1
 
-            await asyncio.sleep(1)  # 1 request + 3 sec sleep
+            await asyncio.sleep(3)
 
-    # Save any remaining data
     if data_chunk:
-        await save_to_csv_async(file_index, data_chunk, list(headers))
+        await save_and_upload_chunk(file_index, data_chunk, list(headers))
 
-    # Merge CSV files
-    merged_filename = 'final_permission_merged.csv'
-    total_records = merge_csv_files('final_permission*.csv', merged_filename)
+    merged_filename = 'finalpermission_merged.csv'
+    total_records = merge_csv_files('finalpermission*.csv', merged_filename)
 
-    # Email final merged file
     if total_records > 0:
-        await asyncio.to_thread(
-            send_email_with_attachment,
-            subject="✅ All Stickers Processed - Final Merged CSV",
-            body=f"Merged CSV file with {total_records} total records is attached.",
-            to_email=EMAIL_TO,
-            attachment_path=merged_filename,
-            smtp_user=EMAIL_USER,
-            smtp_pass=EMAIL_PASS
-        )
+        dropbox_path = f"/{merged_filename}"
+        await asyncio.to_thread(upload_to_dropbox, merged_filename, dropbox_path)
 
     if error_stickers:
         print(f"\n❌ Failed stickers: {error_stickers}")
