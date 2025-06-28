@@ -2,27 +2,40 @@ import asyncio
 import aiohttp
 import csv
 import os
-import dropbox
 from aiohttp import ClientTimeout
 from dotenv import load_dotenv
+import boto3
 
+# Load .env variables
 load_dotenv()
 
+# DOFE API
 url = 'http://srv.dofe.gov.np/Services/DofeWebService.svc/GetFinalApprovalInfo'
-
 start_point = int(os.getenv('START_POINT'))
 end_point = int(os.getenv('END_POINT'))
-chunk_size = 10000
+chunk_size = 5
 error_stickers = []
 data_chunk = {}
 headers = set()
 
-DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
+# AWS S3 setup
+AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+AWS_REGION = os.getenv('AWS_REGION')
+S3_BUCKET = os.getenv('S3_BUCKET')
 
-if not DROPBOX_ACCESS_TOKEN:
-    raise Exception("Missing DROPBOX_ACCESS_TOKEN in environment variables")
+s3_client = boto3.client(
+    's3',
+    region_name=AWS_REGION,
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+)
 
-dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
+def upload_to_s3(file_path):
+    key = os.path.basename(file_path)
+    print(f"[UPLOAD] Uploading {file_path} to S3 bucket {S3_BUCKET} as {key} ...")
+    s3_client.upload_file(file_path, S3_BUCKET, key)
+    print("[DONE] Upload complete.")
 
 def write_csv(filename, data_chunk, headers):
     with open(filename, 'w', newline='', encoding='utf-8') as f:
@@ -30,12 +43,6 @@ def write_csv(filename, data_chunk, headers):
         writer.writeheader()
         for row in data_chunk.values():
             writer.writerow(row)
-
-def upload_to_dropbox(local_path, dropbox_path):
-    with open(local_path, "rb") as f:
-        print(f"[UPLOAD] Uploading {local_path} to Dropbox at {dropbox_path}...")
-        dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode.overwrite)
-    print(f"[DONE] Uploaded to Dropbox: {dropbox_path}")
 
 async def fetch(session, sticker_no, max_retries=3):
     for attempt in range(max_retries):
@@ -65,9 +72,7 @@ async def save_and_upload_chunk(file_index, data_chunk, headers):
     print(f"[WRITE] Saving {len(data_chunk)} records to {filename}")
     await asyncio.to_thread(write_csv, filename, data_chunk, headers)
     print(f"[DONE] Saved: {filename}")
-
-    dropbox_path = f"/{filename}"
-    await asyncio.to_thread(upload_to_dropbox, filename, dropbox_path)
+    await asyncio.to_thread(upload_to_s3, filename)
 
 def merge_csv_files(pattern, output_file):
     import glob
@@ -123,8 +128,7 @@ async def main():
     total_records = merge_csv_files('finalpermission*.csv', merged_filename)
 
     if total_records > 0:
-        dropbox_path = f"/{merged_filename}"
-        await asyncio.to_thread(upload_to_dropbox, merged_filename, dropbox_path)
+        await asyncio.to_thread(upload_to_s3, merged_filename)
 
     if error_stickers:
         print(f"\n❌ Failed stickers: {error_stickers}")
